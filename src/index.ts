@@ -81,8 +81,8 @@ export function apply(ctx: Context): void {
     return value as Record<string, unknown>
   }
 
-  const text = (value: unknown, field: string): string => {
-    if (typeof value !== 'string' || value.trim() === '') throw new Error(`${field} is required`)
+  const field = (value: unknown, name: string): string => {
+    if (typeof value !== 'string' || value.trim() === '') throw new Error(`${name} is required`)
     return value
   }
 
@@ -91,7 +91,7 @@ export function apply(ctx: Context): void {
   const routeOf = (parent: Agent | undefined): { provider?: string; model?: string; reasoningEffort?: string } | undefined =>
     parent?.session.requestHeader()?.config ?? parent?.options ?? ctx.agentDefaultModel?.currentSelection()
 
-  const view = ({ childId, running, contextCount, title }: Chat): ChatView => ({ childId, running, contextCount, title })
+  const chatView = ({ childId, running, contextCount, title }: Chat): ChatView => ({ childId, running, contextCount, title })
 
   /** Every side chat this conversation owns, oldest first. */
   const chatsOf = (parentSessionId: string): Chat[] =>
@@ -104,7 +104,7 @@ export function apply(ctx: Context): void {
     digest(fold((await ctx.sessionQuery.readSession(parentSessionId)).events))
 
   /** Account the hidden child in the parent's workspace so the shared composer does not ask for one. */
-  const account = async (parentSessionId: string, childId: string): Promise<void> => {
+  const accountWorkspace = async (parentSessionId: string, childId: string): Promise<void> => {
     try {
       const workspace = ctx.workspaceRegistry.list().find((item) => item.sessionIds.includes(parentSessionId))
       if (workspace !== undefined) await workspace.attachSession(childId)
@@ -120,8 +120,12 @@ export function apply(ctx: Context): void {
     await session.append('model/selection', { provider: route.provider, model: route.model, ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }) })
   }
 
-  const sections = (agentCtx: Context, contextText: string): void => {
-    agentCtx.systemPrompt.section({ name: 'btw:role', order: 150, text: ROLE })
+  const promptSections = (agentCtx: Context, parentSessionId: string, contextText: string): void => {
+    agentCtx.systemPrompt.section({
+      name: 'btw:role',
+      order: 150,
+      text: `${ROLE}\n\nYou are a side chat of the main conversation with session id "${parentSessionId}" (its transcript is the parent session log under the DSH session store). The user is talking to you in a side panel, not in that main thread. Use the send_to_main tool to hand findings back to the main conversation.`,
+    })
     if (contextText !== '') {
       agentCtx.systemPrompt.section({ name: 'btw:context', order: 200, text: `${CONTEXT}\n\n${contextText}`, interpolate: false })
     }
@@ -132,7 +136,7 @@ export function apply(ctx: Context): void {
    * A step must therefore unarchive just before the archived-session gate sees it,
    * and re-archive once the agent is idle again.
    */
-  const wire = (agentCtx: Context, chat: Chat): void => {
+  const keepHidden = (agentCtx: Context, chat: Chat): void => {
     agentCtx.on('agent/pre-step', async (_payload: unknown, next: () => Promise<unknown>) => {
       await ctx.workspaceRegistry.unarchiveSession(chat.childId)
       return next()
@@ -169,18 +173,56 @@ export function apply(ctx: Context): void {
       agentOptions: selection,
       setup: (agentCtx) => {
         ctx.agentPresets.composeFrom(agentCtx, parent.ctx)
-        sections(agentCtx, history.text)
-        wire(agentCtx, chat)
+        promptSections(agentCtx, parentSessionId, history.text)
+        registerSendToMain(agentCtx, parentSessionId, childId)
+        keepHidden(agentCtx, chat)
       },
     })
     chat.handle = handle
     const preset = ctx.permissionPresets.current(parent.session)
     if (preset !== 'custom') ctx.permissionPresets.set(handle.agent.session, preset)
     await seedSelection(childId, handle.agent.session, selection).catch(() => {})
-    await account(parentSessionId, childId)
+    await accountWorkspace(parentSessionId, childId)
     await ctx.workspaceRegistry.archiveSession(childId).catch(() => {})
     chats.set(childId, chat)
+    ensureParentTool(parentSessionId)
     return chat
+  }
+
+  const toolOutput = (result: string): Array<{ type: 'text'; text: string }> => [{ type: 'text', text: result }]
+
+  const sendToMainDefinition = (parentSessionId: string, childId: string): Record<string, unknown> => ({
+    name: 'send_to_main',
+    description: `Send a message to the main conversation (session ${parentSessionId}) that this side chat belongs to. The main thread receives it as a user message and can act on it. Use it to hand back findings or ask the main thread something; keep it short and self-contained.`,
+    parameters: {
+      type: 'object',
+      properties: {
+        text: { type: 'string', description: 'What the main conversation should see. Write it as a complete, self-contained message.' },
+      },
+      required: ['text'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: { type: 'string' },
+      render: (_args: unknown, result: string) => toolOutput(result),
+    },
+    async execute(args: { text?: unknown }) {
+      const content = typeof args?.text === 'string' ? args.text.trim() : ''
+      if (content === '') throw new Error('text is required')
+      const parent = ctx.agents.get(parentSessionId)
+      if (parent === undefined) throw new Error('the main conversation is not live')
+      parent.followup({
+        id: randomUUID(),
+        role: 'user',
+        content: [{ type: 'text', text: `[side chat ${childId}] ${content}` }],
+        source: { kind: 'user' },
+      })
+      return 'Sent to the main conversation.'
+    },
+  })
+
+  const registerSendToMain = (agentCtx: Context, parentSessionId: string, childId: string): void => {
+    agentCtx.tools?.register(sendToMainDefinition(parentSessionId, childId))
   }
 
   /** Make a chat live without running it; the client session then prompts it normally. */
@@ -198,14 +240,67 @@ export function apply(ctx: Context): void {
       resumeSessionId: chat.childId,
       agentOptions: selection,
       setup: (agentCtx) => {
-        sections(agentCtx, history.text)
-        wire(agentCtx, chat)
+        // A resume builds a fresh agent scope; the create-time preset binding is gone.
+        if (parent !== undefined) ctx.agentPresets.composeFrom(agentCtx, parent.ctx)
+        promptSections(agentCtx, chat.parentSessionId, history.text)
+        registerSendToMain(agentCtx, chat.parentSessionId, chat.childId)
+        keepHidden(agentCtx, chat)
       },
     })
     await seedSelection(chat.childId, chat.handle.agent.session, selection).catch(() => {})
-    await account(chat.parentSessionId, chat.childId)
+    await accountWorkspace(chat.parentSessionId, chat.childId)
+    ensureParentTool(chat.parentSessionId)
     return chat.handle
   }
+
+  const parentTools = new Map<string, () => void>()
+
+  const sendToSideDefinition = (parentSessionId: string): Record<string, unknown> => ({
+    name: 'send_to_side',
+    description: 'Send a message to one of your btw side chats. Defaults to the most recent side chat; pass childId to target a specific one. The side chat receives it as a user message and runs a turn.',
+    parameters: {
+      type: 'object',
+      properties: {
+        text: { type: 'string', description: 'What the side chat should do or know. Write it as a complete, self-contained message.' },
+        childId: { type: 'string', description: 'Target side-chat id. Omit to use the most recent one.' },
+      },
+      required: ['text'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: { type: 'string' },
+      render: (_args: unknown, result: string) => toolOutput(result),
+    },
+    async execute(args: { text?: unknown; childId?: unknown }) {
+      const content = typeof args?.text === 'string' ? args.text.trim() : ''
+      if (content === '') throw new Error('text is required')
+      const owned = chatsOf(parentSessionId)
+      const requested = typeof args?.childId === 'string' && args.childId !== '' ? args.childId : undefined
+      const target = requested === undefined ? owned[owned.length - 1] : chats.get(requested)
+      if (target === undefined || target.parentSessionId !== parentSessionId) throw new Error('unknown side chat')
+      const handle = await attach(target)
+      handle.agent.followup({
+        id: randomUUID(),
+        role: 'user',
+        content: [{ type: 'text', text: `[main thread] ${content}` }],
+        source: { kind: 'user' },
+      })
+      return `Sent to ${target.childId}.`
+    },
+  })
+
+  /** One send_to_side tool per live main agent; multiple side chats share it. */
+  const ensureParentTool = (parentSessionId: string): void => {
+    if (parentTools.has(parentSessionId)) return
+    const parent = ctx.agents.get(parentSessionId)
+    if (parent?.ctx.tools === undefined) return
+    parentTools.set(parentSessionId, parent.ctx.tools.register(sendToSideDefinition(parentSessionId)))
+  }
+
+  ctx.effect(() => () => {
+    for (const dispose of parentTools.values()) dispose()
+    parentTools.clear()
+  }, 'btw: parent tools')
 
   const titleOfSession = async (childId: string): Promise<string> => {
     try {
@@ -236,9 +331,10 @@ export function apply(ctx: Context): void {
     restored.add(parentSessionId)
   }
 
-  const list = async (parentSessionId: string): Promise<Chat[]> => {
+  const sideChats = async (parentSessionId: string): Promise<Chat[]> => {
     await restore(parentSessionId)
     const owned = chatsOf(parentSessionId)
+    ensureParentTool(parentSessionId)
     await Promise.all(owned.map(async (chat) => {
       if (chat.title !== '') return
       const title = await titleOfSession(chat.childId)
@@ -260,19 +356,19 @@ export function apply(ctx: Context): void {
         const action = url.pathname.slice(PREFIX.length)
         if (req.method === 'POST' && action === '/start') {
           const body = await requestBody(req)
-          const chat = await create(text(body.parentSessionId, 'parentSessionId'))
+          const chat = await create(field(body.parentSessionId, 'parentSessionId'))
           return reply(res, 200, { childId: chat.childId, contextCount: chat.contextCount, title: chat.title })
         }
         if (req.method === 'POST' && action === '/attach') {
           const body = await requestBody(req)
-          const chat = chats.get(text(body.childId, 'childId'))
+          const chat = chats.get(field(body.childId, 'childId'))
           if (chat === undefined) return reply(res, 404, { error: 'unknown side chat' })
           await attach(chat)
           return reply(res, 200, { childId: chat.childId, contextCount: chat.contextCount, title: chat.title })
         }
         if (req.method === 'POST' && action === '/close') {
           const body = await requestBody(req)
-          const childId = text(body.childId, 'childId')
+          const childId = field(body.childId, 'childId')
           const chat = chats.get(childId)
           if (chat === undefined) return reply(res, 404, { error: 'unknown side chat' })
           chat.handle?.agent.cancel({ kind: 'user' })
@@ -284,8 +380,8 @@ export function apply(ctx: Context): void {
         if (req.method === 'GET' && action === '/state') {
           const parentSessionId = url.searchParams.get('parentSessionId') ?? ''
           if (parentSessionId === '') return reply(res, 200, { chats: [] })
-          const owned = await list(parentSessionId)
-          return reply(res, 200, { chats: owned.map(view) })
+          const owned = await sideChats(parentSessionId)
+          return reply(res, 200, { chats: owned.map(chatView) })
         }
         if (req.method === 'POST' && action === '/client-error') {
           const body = await requestBody(req)

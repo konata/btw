@@ -78,5 +78,6 @@ export interface Context {
     section(input: { name: string; order: number; text: string; interpolate?: boolean }): void
   }
   effect(fn: () => void | (() => void), label?: string): void
+  tools?: { register(definition: Record<string, unknown>): () => void }
   on(name: string, listener: (...args: any[]) => any, options?: { prepend?: boolean }): () => void
 }

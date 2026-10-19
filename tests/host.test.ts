@@ -20,6 +20,17 @@ const boot = (onDisk: Record_[] = []) => {
   const created: string[] = []
   const cancelled: string[] = []
   const disposed: string[] = []
+  const sections: Array<{ name: string; text: string }> = []
+  let composed = 0
+  const tools: Array<Record<string, any>> = []
+  const parentTools: Array<Record<string, any>> = []
+  const followups: Array<{ content: Array<{ text: string }> }> = []
+  const childFollowups: Array<{ content: Array<{ text: string }> }> = []
+  const agentCtx = {
+    systemPrompt: { section: (input: { name: string; text: string }) => { sections.push(input) } },
+    tools: { register: (definition: Record<string, any>) => { tools.push(definition); return () => {} } },
+    on: () => () => {},
+  }
   let finish: () => void = () => {}
   const idle = new Promise<void>((resolve) => { finish = resolve })
   let handler: ((request: unknown, response: unknown) => Promise<void>) | undefined
@@ -28,22 +39,35 @@ const boot = (onDisk: Record_[] = []) => {
     webServer: { register: (route: { handler: typeof handler }) => { handler = route.handler; return () => {} } },
     agents: {
       get: (id: string) => id === 'parent-1'
-        ? { session: { header: {}, requestHeader: () => ({ config: { provider: 'p', model: 'm' } }) }, ctx: {}, followup: () => {}, cancel: () => {} }
+        ? { session: { header: {}, requestHeader: () => ({ config: { provider: 'p', model: 'm' } }) }, ctx: { tools: { register: (definition: Record<string, any>) => { parentTools.push(definition); return () => {} } } }, followup: (input: { content: Array<{ text: string }> }) => { followups.push(input) }, cancel: () => {} }
         : undefined,
-      create: async (options: { sessionId: string }) => {
+      create: async (options: { sessionId: string; setup?: (scope: unknown) => void }) => {
         created.push(options.sessionId)
+        options.setup?.(agentCtx)
         return {
           agent: {
-            session: { header: {}, requestHeader: () => ({ config: { provider: 'p', model: 'm' } }) },
+            session: { header: {}, requestHeader: () => ({ config: { provider: 'p', model: 'm' } }), append: () => {} },
             ctx: {},
-            followup: () => {},
+            followup: (input: { content: Array<{ text: string }> }) => { childFollowups.push(input) },
             cancel: () => { cancelled.push('agent') },
             whenIdle: () => idle,
           },
           dispose: async () => { disposed.push(options.sessionId) },
         }
       },
-      resume: async () => { throw new Error('no resume in this test') },
+      resume: async (options: { setup?: (scope: unknown) => void }) => {
+        options.setup?.(agentCtx)
+        return {
+          agent: {
+            session: { header: {}, requestHeader: () => ({ config: { provider: 'p', model: 'm' } }), append: () => {} },
+            ctx: {},
+            followup: (input: { content: Array<{ text: string }> }) => { childFollowups.push(input) },
+            cancel: () => {},
+            whenIdle: async () => {},
+          },
+          dispose: async () => {},
+        }
+      },
     },
     sessionQuery: {
       readSession: async (id: string) => ({ events: onDisk.find((record) => record.id === id)?.events ?? [] }),
@@ -51,7 +75,7 @@ const boot = (onDisk: Record_[] = []) => {
     },
     workspaceRegistry: { archiveSession: async () => {}, unarchiveSession: async () => {} },
     permissionPresets: { current: () => 'custom', set: () => {} },
-    agentPresets: { composeFrom: () => {} },
+    agentPresets: { composeFrom: () => { composed += 1 } },
     effect: (fn: () => void | (() => void)) => { fn() },
   } as unknown as Context
 
@@ -64,6 +88,7 @@ const boot = (onDisk: Record_[] = []) => {
     const request = {
       method,
       url: `/btw/api${path}`,
+      headers: { host: '127.0.0.1:3000' },
       socket: { remoteAddress: remote },
       async *[Symbol.asyncIterator]() { if (payload !== '') yield Buffer.from(payload) },
     }
@@ -74,16 +99,27 @@ const boot = (onDisk: Record_[] = []) => {
     return { status, value: value as Record<string, unknown> }
   }
 
-  return { call, created, cancelled, disposed, finish }
+  return { call, created, cancelled, disposed, sections, tools, parentTools, followups, childFollowups, composed: () => composed, finish }
 }
 
 describe('btw host', () => {
   it('creates a blank side chat that the client then fills', async () => {
-    const { call, created } = boot()
+    const { call, created, sections: promptSections, tools, parentTools, followups, childFollowups } = boot()
     const first = await call('POST', '/start', { parentSessionId: 'parent-1' })
     const second = await call('POST', '/start', { parentSessionId: 'parent-1' })
 
     expect(first.value.childId).not.toBe(second.value.childId)
+    expect(promptSections.some((section) => section.name === 'btw:role' && section.text.includes('parent-1'))).toBe(true)
+
+    const childTool = tools.find((tool) => tool.name === 'send_to_main')
+    const parentTool = parentTools.find((tool) => tool.name === 'send_to_side')
+    expect(childTool).toBeDefined()
+    expect(parentTool).toBeDefined()
+    await (childTool?.execute as (args: { text: string }) => Promise<string>)({ text: 'found it' })
+    expect(followups[0]?.content[0]?.text).toContain('found it')
+    await (parentTool?.execute as (args: { text: string }) => Promise<string>)({ text: 'run the tests' })
+    expect(childFollowups[0]?.content[0]?.text).toContain('run the tests')
+
     expect(created).toEqual([first.value.childId, second.value.childId])
     expect(first.value.title).toBe('')
 
@@ -92,6 +128,14 @@ describe('btw host', () => {
       { childId: first.value.childId, running: false, contextCount: 0, title: '' },
       { childId: second.value.childId, running: false, contextCount: 0, title: '' },
     ])
+  })
+
+  it('recomposes the parent preset when resuming a side chat', async () => {
+    const { call, composed } = boot([{ id: 'btw-old', createdAt: 1, events: [] }])
+    await call('GET', '/state?parentSessionId=parent-1')
+    const response = await call('POST', '/attach', { childId: 'btw-old' })
+    expect(response.status).toBe(200)
+    expect(composed()).toBe(1)
   })
 
   it('closes a side chat and keeps it out of the list', async () => {
