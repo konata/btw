@@ -78,34 +78,20 @@ const boot = (onDisk: Record_[] = []) => {
 }
 
 describe('btw host', () => {
-  it('starts a new side chat per message instead of reusing the first one', async () => {
-    const { call, created, cancelled, finish } = boot()
-    const first = await call('POST', '/start', { parentSessionId: 'parent-1', text: 'first question' })
-    const second = await call('POST', '/start', { parentSessionId: 'parent-1', text: 'second question' })
+  it('creates a blank side chat that the client then fills', async () => {
+    const { call, created } = boot()
+    const first = await call('POST', '/start', { parentSessionId: 'parent-1' })
+    const second = await call('POST', '/start', { parentSessionId: 'parent-1' })
 
     expect(first.value.childId).not.toBe(second.value.childId)
     expect(created).toEqual([first.value.childId, second.value.childId])
-    expect(first.value.title).toBe('first question')
+    expect(first.value.title).toBe('')
 
     const state = await call('GET', '/state?parentSessionId=parent-1')
     expect(state.value.chats).toEqual([
-      { childId: first.value.childId, running: true, contextCount: 0, title: 'first question' },
-      { childId: second.value.childId, running: true, contextCount: 0, title: 'second question' },
+      { childId: first.value.childId, running: false, contextCount: 0, title: '' },
+      { childId: second.value.childId, running: false, contextCount: 0, title: '' },
     ])
-
-    expect((await call('POST', '/stop', { childId: first.value.childId })).status).toBe(200)
-    expect(cancelled).toEqual(['agent'])
-    finish()
-  })
-
-  it('reports input queued behind a running turn', async () => {
-    const { call } = boot()
-    const first = await call('POST', '/start', { parentSessionId: 'parent-1', text: 'first' })
-    await call('POST', '/send', { childId: first.value.childId, text: 'queued question' })
-
-    const history = await call('GET', `/history?childId=${first.value.childId}`)
-    expect(history.value.queued).toEqual(['queued question'])
-    expect(history.value.running).toBe(true)
   })
 
   it('closes a side chat and keeps it out of the list', async () => {

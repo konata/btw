@@ -30,7 +30,14 @@ await writeFile('lib/client.js', `window.__ModuleLoader__.load({
 	factory: (require) => {
 		var module = { exports: {} };
 		var exports = module.exports;
+		try {
 ${body}
+		} catch (error) {
+			try {
+				fetch('/btw/api/client-error', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ message: String(error && error.message || error), stack: String(error && error.stack || '') }) });
+			} catch {}
+			throw error;
+		}
 		return module.exports;
 	}
 });

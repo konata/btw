@@ -18,10 +18,8 @@ interface Chat {
   running: boolean
   contextCount: number
   createdAt: number
-  /** The first thing the user asked, so the switcher can tell chats apart. */
+  /** Derived lazily from the first user message; empty while the chat is still blank. */
   title: string
-  /** Messages sent while a turn was in flight; the agent admits them on the next turn. */
-  queued: string[]
 }
 
 interface ChatView {
@@ -38,6 +36,8 @@ export const inject = ['webServer', 'agents', 'sessionQuery', 'workspaceRegistry
 export function apply(ctx: Context): void {
   const chats = new Map<string, Chat>()
   const restored = new Set<string>()
+  let clientHealth: { ready: boolean; error: string | null } = { ready: false, error: null }
+
   const closedPath = join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'btw', 'closed.json')
   let closed: Set<string> | undefined
 
@@ -64,24 +64,22 @@ export function apply(ctx: Context): void {
   }
 
   const reply = (res: ServerResponse, status: number, value: unknown): void => {
-    res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
-    res.end(JSON.stringify(value))
+    const body = JSON.stringify(value)
+    res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': String(Buffer.byteLength(body)) })
+    res.end(body)
   }
 
   const requestBody = async (req: IncomingMessage): Promise<Record<string, unknown>> => {
-    const chunks: Buffer[] = []
-    let size = 0
+    let raw = ''
     for await (const chunk of req) {
-      size += chunk.length
-      if (size > 1_000_000) throw new Error('request body too large')
-      chunks.push(chunk as Buffer)
+      raw += String(chunk)
+      if (raw.length > 64 * 1024) throw new Error('request body is too large')
     }
-    return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}') as Record<string, unknown>
+    if (raw === '') return {}
+    const value: unknown = JSON.parse(raw)
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error('request body must be an object')
+    return value as Record<string, unknown>
   }
-
-  /** Requests come from the Web shell on this machine; nothing else may drive an agent. */
-  const local = (req: IncomingMessage): boolean =>
-    ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.socket.remoteAddress ?? '')
 
   const text = (value: unknown, field: string): string => {
     if (typeof value !== 'string' || value.trim() === '') throw new Error(`${field} is required`)
@@ -89,6 +87,9 @@ export function apply(ctx: Context): void {
   }
 
   const titleOf = (raw: string): string => raw.trim().replace(/\s+/g, ' ').slice(0, 40)
+
+  const routeOf = (parent: Agent | undefined): { provider?: string; model?: string; reasoningEffort?: string } | undefined =>
+    parent?.session.requestHeader()?.config ?? parent?.options ?? ctx.agentDefaultModel?.currentSelection()
 
   const view = ({ childId, running, contextCount, title }: Chat): ChatView => ({ childId, running, contextCount, title })
 
@@ -98,96 +99,117 @@ export function apply(ctx: Context): void {
       .filter((chat) => chat.parentSessionId === parentSessionId)
       .sort((left, right) => left.createdAt - right.createdAt)
 
-  /** The route a side chat follows: the parent's live route, else its configured options, else the deployment default. */
-  const routeOf = (parent: Agent | undefined): { provider?: string; model?: string; reasoningEffort?: string } | undefined =>
-    parent?.session.requestHeader()?.config ?? parent?.options ?? ctx.agentDefaultModel?.currentSelection()
+  /** Read the parent's recent transcript; used both at fork time and on a later reattach. */
+  const contextOf = async (parentSessionId: string): Promise<ReturnType<typeof digest>> =>
+    digest(fold((await ctx.sessionQuery.readSession(parentSessionId)).events))
 
-  /** Resume a restored chat on first use; fresh chats already hold their handle. */
-  const attach = async (chat: Chat): Promise<AgentHandle> => {
-    if (chat.handle !== undefined) return chat.handle
-    const route = routeOf(ctx.agents.get(chat.parentSessionId))
-    if (route?.provider === undefined || route.model === undefined) throw new Error('no model route for the side chat')
-    chat.handle = await ctx.agents.resume({
-      resumeSessionId: chat.childId,
-      agentOptions: {
-        provider: route.provider,
-        model: route.model,
-        ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }),
-      },
-      setup: (agentCtx) => {
-        agentCtx.systemPrompt.section({ name: 'btw:role', order: 150, text: ROLE })
-      },
+  /** Account the hidden child in the parent's workspace so the shared composer does not ask for one. */
+  const account = async (parentSessionId: string, childId: string): Promise<void> => {
+    try {
+      const workspace = ctx.workspaceRegistry.list().find((item) => item.sessionIds.includes(parentSessionId))
+      if (workspace !== undefined) await workspace.attachSession(childId)
+    } catch {
+      // Accounting is best-effort: the composer still works, it just asks for a workspace.
+    }
+  }
+
+  /** Seed the model/effort selection the shared composer and the request header both read. */
+  const seedSelection = async (childId: string, session: { append(type: string, data: Record<string, unknown>): unknown }, route: { provider: string; model: string; reasoningEffort?: string }): Promise<void> => {
+    const events = (await ctx.sessionQuery.readSession(childId)).events
+    if (events.some((event) => event.type === 'model/selection' || event.type === 'request/header')) return
+    await session.append('model/selection', { provider: route.provider, model: route.model, ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }) })
+  }
+
+  const sections = (agentCtx: Context, contextText: string): void => {
+    agentCtx.systemPrompt.section({ name: 'btw:role', order: 150, text: ROLE })
+    if (contextText !== '') {
+      agentCtx.systemPrompt.section({ name: 'btw:context', order: 200, text: `${CONTEXT}\n\n${contextText}`, interpolate: false })
+    }
+  }
+
+  /**
+   * Archive is the only thing that keeps a side chat out of the session lists.
+   * A step must therefore unarchive just before the archived-session gate sees it,
+   * and re-archive once the agent is idle again.
+   */
+  const wire = (agentCtx: Context, chat: Chat): void => {
+    agentCtx.on('agent/pre-step', async (_payload: unknown, next: () => Promise<unknown>) => {
+      await ctx.workspaceRegistry.unarchiveSession(chat.childId)
+      return next()
+    }, { prepend: true })
+    agentCtx.on('agent/status', (payload: { status?: string }) => {
+      chat.running = payload.status === 'running'
+      if (payload.status === 'idle') void ctx.workspaceRegistry.archiveSession(chat.childId).catch(() => {})
     })
-    return chat.handle
   }
 
-  const turn = (chat: Chat, input: string): void => {
-    chat.running = true
-    void (async () => {
-      try {
-        const handle = await attach(chat)
-        await ctx.workspaceRegistry.unarchiveSession(chat.childId)
-        handle.agent.followup({ id: randomUUID(), role: 'user', content: [{ type: 'text', text: input }], source: { kind: 'user' } })
-        await handle.agent.whenIdle()
-      } catch (error) {
-        console.error('[btw] turn failed:', error)
-      } finally {
-        chat.running = false
-        chat.queued = []
-        await ctx.workspaceRegistry.archiveSession(chat.childId).catch(() => {})
-      }
-    })()
-  }
-
-  const create = async (parentSessionId: string, input: string): Promise<Chat> => {
+  const create = async (parentSessionId: string): Promise<Chat> => {
     const parent = ctx.agents.get(parentSessionId)
     if (parent === undefined) throw new Error('the main conversation is not live')
-    const history = digest(fold((await ctx.sessionQuery.readSession(parentSessionId)).events))
+    const history = await contextOf(parentSessionId)
     const route = routeOf(parent)
     if (route?.provider === undefined || route.model === undefined) throw new Error('no model route for the side chat')
-    const agentOptions = {
-      provider: route.provider,
-      model: route.model,
-      ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }),
-    }
+    const selection = { provider: route.provider, model: route.model, ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }) }
 
     const childId = `btw-${randomUUID()}`
-    const handle = await ctx.agents.create({
-      sessionId: childId,
-      meta: { parentSession: parentSessionId, ...(parent.session.header.cwd === undefined ? {} : { cwd: parent.session.header.cwd }) },
-      agentOptions,
-      setup: (agentCtx) => {
-        ctx.agentPresets.composeFrom(agentCtx, parent.ctx)
-        agentCtx.systemPrompt.section({ name: 'btw:role', order: 150, text: ROLE })
-        if (history.text !== '') {
-          agentCtx.systemPrompt.section({ name: 'btw:context', order: 200, text: `${CONTEXT}\n\n${history.text}`, interpolate: false })
-        }
-      },
-    })
-
-    const preset = ctx.permissionPresets.current(parent.session)
-    if (preset !== 'custom') ctx.permissionPresets.set(handle.agent.session, preset)
-    await ctx.workspaceRegistry.archiveSession(childId).catch(() => {})
-
     const chat: Chat = {
       childId,
       parentSessionId,
-      handle,
       running: false,
       contextCount: history.count,
       createdAt: Date.now(),
-      title: titleOf(input),
-      queued: [],
+      title: '',
     }
+    const handle = await ctx.agents.create({
+      sessionId: childId,
+      meta: {
+        parentSession: parentSessionId,
+        cwd: parent.session.header.cwd ?? process.cwd(),
+      },
+      agentOptions: selection,
+      setup: (agentCtx) => {
+        ctx.agentPresets.composeFrom(agentCtx, parent.ctx)
+        sections(agentCtx, history.text)
+        wire(agentCtx, chat)
+      },
+    })
+    chat.handle = handle
+    const preset = ctx.permissionPresets.current(parent.session)
+    if (preset !== 'custom') ctx.permissionPresets.set(handle.agent.session, preset)
+    await seedSelection(childId, handle.agent.session, selection).catch(() => {})
+    await account(parentSessionId, childId)
+    await ctx.workspaceRegistry.archiveSession(childId).catch(() => {})
     chats.set(childId, chat)
-    turn(chat, input)
     return chat
+  }
+
+  /** Make a chat live without running it; the client session then prompts it normally. */
+  const attach = async (chat: Chat): Promise<AgentHandle> => {
+    if (chat.handle !== undefined) return chat.handle
+    const parent = ctx.agents.get(chat.parentSessionId)
+    const route = routeOf(parent)
+    const provider = route?.provider
+    const model = route?.model
+    if (provider === undefined || model === undefined) throw new Error('no model route for the side chat')
+    const selection = { provider, model, ...(route?.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort }) }
+    const history = await contextOf(chat.parentSessionId)
+    chat.contextCount = history.count
+    chat.handle = await ctx.agents.resume({
+      resumeSessionId: chat.childId,
+      agentOptions: selection,
+      setup: (agentCtx) => {
+        sections(agentCtx, history.text)
+        wire(agentCtx, chat)
+      },
+    })
+    await seedSelection(chat.childId, chat.handle.agent.session, selection).catch(() => {})
+    await account(chat.parentSessionId, chat.childId)
+    return chat.handle
   }
 
   const titleOfSession = async (childId: string): Promise<string> => {
     try {
-      const events = (await ctx.sessionQuery.readSession(childId)).events
-      const first = display(events).find((line) => line.role === 'user')
+      const first = display((await ctx.sessionQuery.readSession(childId)).events).find((line) => line.role === 'user')
       return first === undefined ? '' : titleOf(first.text)
     } catch {
       return ''
@@ -197,56 +219,56 @@ export function apply(ctx: Context): void {
   /** Reattach every side chat a previous host left on disk for this conversation. */
   const restore = async (parentSessionId: string): Promise<void> => {
     if (restored.has(parentSessionId)) return
+    const closedIds = await closedChats()
     const records = await ctx.sessionQuery.filterSessions([{ kind: 'parent', values: [parentSessionId] }])
-    const revived: Chat[] = []
     for (const record of records) {
       const childId = record.header.id
-      if (!childId.startsWith('btw-') || chats.has(childId)) continue
-      if ((await closedChats()).has(childId)) continue
-      const chat: Chat = {
+      if (!childId.startsWith('btw-') || chats.has(childId) || closedIds.has(childId)) continue
+      chats.set(childId, {
         childId,
         parentSessionId,
         running: false,
         contextCount: 0,
         createdAt: record.header.createdAt,
         title: '',
-        queued: [],
-      }
-      chats.set(childId, chat)
-      revived.push(chat)
+      })
     }
     restored.add(parentSessionId)
-    await Promise.all(revived.map(async (chat) => { chat.title = await titleOfSession(chat.childId) }))
+  }
+
+  const list = async (parentSessionId: string): Promise<Chat[]> => {
+    await restore(parentSessionId)
+    const owned = chatsOf(parentSessionId)
+    await Promise.all(owned.map(async (chat) => {
+      if (chat.title !== '') return
+      const title = await titleOfSession(chat.childId)
+      if (title !== '') chat.title = title
+    }))
+    return owned
   }
 
   ctx.effect(() => ctx.webServer.register({
     kind: 'prefix',
     path: PREFIX,
-    handler: async (req, res) => {
-      if (!local(req)) return reply(res, 403, { error: 'btw is loopback only' })
-      const url = new URL(req.url ?? '/', 'http://btw.local')
-      const action = url.pathname.slice(PREFIX.length)
+    async handler(req: IncomingMessage, res: ServerResponse): Promise<void> {
       try {
+        if (req.socket.remoteAddress !== '127.0.0.1' && req.socket.remoteAddress !== '::1') {
+          return reply(res, 403, { error: 'btw is local only' })
+        }
+        const url = new URL(req.url ?? '/', 'http://localhost')
+        if (!url.pathname.startsWith(PREFIX)) return reply(res, 404, { error: 'not found' })
+        const action = url.pathname.slice(PREFIX.length)
         if (req.method === 'POST' && action === '/start') {
           const body = await requestBody(req)
-          const chat = await create(text(body.parentSessionId, 'parentSessionId'), text(body.text, 'text'))
+          const chat = await create(text(body.parentSessionId, 'parentSessionId'))
           return reply(res, 200, { childId: chat.childId, contextCount: chat.contextCount, title: chat.title })
         }
-        if (req.method === 'POST' && action === '/send') {
+        if (req.method === 'POST' && action === '/attach') {
           const body = await requestBody(req)
           const chat = chats.get(text(body.childId, 'childId'))
           if (chat === undefined) return reply(res, 404, { error: 'unknown side chat' })
-          const input = text(body.text, 'text')
-          if (chat.running) chat.queued.push(input)
-          turn(chat, input)
-          return reply(res, 200, { ok: true })
-        }
-        if (req.method === 'POST' && action === '/stop') {
-          const body = await requestBody(req)
-          const chat = chats.get(text(body.childId, 'childId'))
-          if (chat === undefined) return reply(res, 404, { error: 'unknown side chat' })
-          chat.handle?.agent.cancel({ kind: 'user' })
-          return reply(res, 200, { ok: true })
+          await attach(chat)
+          return reply(res, 200, { childId: chat.childId, contextCount: chat.contextCount, title: chat.title })
         }
         if (req.method === 'POST' && action === '/close') {
           const body = await requestBody(req)
@@ -262,14 +284,21 @@ export function apply(ctx: Context): void {
         if (req.method === 'GET' && action === '/state') {
           const parentSessionId = url.searchParams.get('parentSessionId') ?? ''
           if (parentSessionId === '') return reply(res, 200, { chats: [] })
-          await restore(parentSessionId)
-          return reply(res, 200, { chats: chatsOf(parentSessionId).map(view) })
+          const owned = await list(parentSessionId)
+          return reply(res, 200, { chats: owned.map(view) })
         }
-        if (req.method === 'GET' && action === '/history') {
-          const chat = chats.get(url.searchParams.get('childId') ?? '')
-          if (chat === undefined) return reply(res, 404, { error: 'unknown side chat' })
-          const events = (await ctx.sessionQuery.readSession(chat.childId)).events
-          return reply(res, 200, { messages: display(events), running: chat.running, title: chat.title, queued: chat.queued })
+        if (req.method === 'POST' && action === '/client-error') {
+          const body = await requestBody(req)
+          clientHealth = { ready: false, error: `${String(body.message ?? 'unknown')}\n${String(body.stack ?? '')}` }
+          console.error('[btw] client failed to activate:', clientHealth.error)
+          return reply(res, 200, { ok: true })
+        }
+        if (req.method === 'POST' && action === '/client-ready') {
+          clientHealth = { ready: true, error: clientHealth.error }
+          return reply(res, 200, { ok: true })
+        }
+        if (req.method === 'GET' && action === '/client-health') {
+          return reply(res, 200, clientHealth)
         }
         return reply(res, 404, { error: 'unknown btw route' })
       } catch (error) {

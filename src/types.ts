@@ -3,6 +3,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 /** The session fields btw reads: workspace metadata and the folded request route. */
 export interface Session {
   header: { cwd?: string }
+  append(type: string, data: Record<string, unknown>): unknown
   requestHeader(): { config?: { provider?: string; model?: string; reasoningEffort?: string } } | undefined
 }
 
@@ -58,6 +59,10 @@ export interface Context {
   workspaceRegistry: {
     archiveSession(id: string, options?: { stopActivity?: boolean }): Promise<void>
     unarchiveSession(id: string): Promise<void>
+    list(): Array<{
+      sessionIds: string[]
+      attachSession(id: string): Promise<void>
+    }>
   }
   permissionPresets: {
     current(session: Session): string
@@ -73,4 +78,5 @@ export interface Context {
     section(input: { name: string; order: number; text: string; interpolate?: boolean }): void
   }
   effect(fn: () => void | (() => void), label?: string): void
+  on(name: string, listener: (...args: any[]) => any, options?: { prepend?: boolean }): () => void
 }
